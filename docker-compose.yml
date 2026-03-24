@@ -1,0 +1,49 @@
+services:
+  euro_stat_db:
+    image: mongo:6.0
+    container_name: euro_stat_db
+    restart: "no"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - euro_stat
+
+  euro_stat_be:
+    build:
+      context: ./euro-stat-BE
+      dockerfile: Dockerfile
+    container_name: euro_stat_be
+    restart: "no"
+    depends_on:
+      - euro_stat_db
+    environment:
+      MONGO_URL: mongodb://admin:admin123@euro_stat_db:27017/euro_stat_db?authSource=admin
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./euro-stat-BE:/app
+    networks:
+      - euro_stat
+
+  euro_stat_fe:
+    build:
+      context: ./euro-stat-FE
+      dockerfile: Dockerfile
+    container_name: euro_stat_fe
+    restart: "no"
+    ports:
+      - "5173:80"
+    networks:
+      - euro_stat
+
+volumes:
+  mongo_data:
+
+networks:
+  euro_stat:
+    name: euro_stat
