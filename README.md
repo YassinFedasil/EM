@@ -107,7 +107,7 @@ docker compose up --build
 
 - Frontend: http://localhost:5173
 - Backend: http://localhost:8000
-- MongoDB: localhost:27017 (root credentials default to `admin` / `admin123`)
+- MongoDB: localhost:27018 (root credentials default to `admin` / `admin123`)
 
 Override defaults by creating a `.env` at the repository root (see
 `.env.example`).
