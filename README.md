@@ -91,6 +91,7 @@ See the root `.env.example` and `euro-stat-FE/.env.example`.
 | `MONGO_COLLECTION_NUMBERS` | `numbers_full` | backend |
 | `MONGO_COLLECTION_STARS` | `stars_full` | backend |
 | `MONGO_COLLECTION_DRAW_DATA` | `draw_data` | backend |
+| `MONGO_COLLECTION_COMBINATIONS` | `generated_combinations` | backend |
 | `DRIVE_DATA_FOLDER_ID` | *(built-in folder id)* | backend |
 | `GOOGLE_CREDENTIALS_FILE` | `credentials.json` | backend |
 | `CORS_ORIGINS` | localhost dev origins | backend |
@@ -510,6 +511,185 @@ Le tableau peut contenir des valeurs spéciales héritées des sources :
 > Comme les graphes, ces données sont **descriptives** (état des indicateurs à
 > une date donnée) et ne permettent pas de prédire un tirage futur.
 
+## Génération et historique des combinaisons (`/` et `/history`)
+
+Cette section décrit deux écrans liés : la **génération** de combinaisons
+(`EuroMillions.tsx`, route `/`) et l'**historique** qui les confronte aux
+résultats officiels (`History.tsx`, route `/history`, entrée « History » de la
+barre latérale).
+
+> Les combinaisons produites sont des **propositions aléatoires**. Ce ne sont ni
+> des prédictions, ni des recommandations de jeu : l'application ne calcule
+> aucune probabilité de gain.
+
+### 1. Génération des combinaisons (page `/`)
+
+Page : http://localhost:5173/
+
+1. Saisir une date de tirage au format `JJ-MM-AAAA` (la date du jour est
+   pré-remplie) puis cliquer **Démarrer**. La date doit être une date réelle :
+   `32-13-2026` est refusé.
+2. L'application charge les **pools disponibles** pour cette date :
+   - les 50 numéros via `GET /api/numbers/{date}` ;
+   - les 12 étoiles via `GET /api/stars/{date}`.
+
+   Ces endpoints lisent le cache MongoDB et, en cas d'absence, les tableaux
+   importés depuis Google Drive (même mécanisme que la page `/numbers`, voir
+   [Page des données par date](#page-des-données-par-date-numéros--signification-de-laffichage)).
+3. **Cinq combinaisons sont générées en une seule fois**, numérotées de **1 à
+   5** dans l'ordre d'affichage.
+4. Composition de **chaque** combinaison :
+   - **5 numéros distincts** choisis entre **1 et 50**, affichés en ordre
+     croissant ;
+   - **2 étoiles distinctes** choisies entre **1 et 12**, affichées en ordre
+     croissant.
+5. Les 5 combinaisons de l'ensemble sont **distinctes entre elles** (aucun
+   doublon exact de numéros + étoiles).
+
+Le bouton **Nouvelle combinaison** régénère **un nouvel ensemble complet de 5
+combinaisons** (il ne remplace pas une seule ligne) ; il ne modifie rien en base
+tant que l'enregistrement n'a pas été demandé. Changer la date efface les
+combinaisons affichées et impose un nouveau **Démarrer**.
+
+| Situation | Comportement de l'écran |
+| --- | --- |
+| Date mal formée ou inexistante | Message d'erreur, aucune combinaison générée. |
+| Tirage absent (aucune donnée pour la date) | Message « Aucun tirage disponible… » ; aucune combinaison. |
+| Données incomplètes (< 5 numéros ou < 2 étoiles) | Message explicite ; aucune combinaison. |
+| Serveur/Drive indisponible | Message d'indisponibilité temporaire ; aucune combinaison. |
+| Aucune combinaison générée | Le bouton d'enregistrement n'est pas affiché. |
+
+### 2. Enregistrement explicite et règle « une seule version par date »
+
+L'enregistrement n'est **jamais automatique** : il faut cliquer sur
+**Enregistrer les 5 combinaisons**. Régénérer, changer la date ou quitter la
+page avant cet appui ne modifie pas la base.
+
+Règles appliquées par le backend (`PUT /api/combinations/{date}`) :
+
+- **Un seul ensemble de 5 combinaisons par date** est conservé. La date sert
+  d'identifiant du document dans la collection `generated_combinations`
+  (`_id = "JJ-MM-AAAA"`), ce qui rend l'unicité structurelle.
+- Un nouvel enregistrement pour une date **remplace intégralement** l'ensemble
+  précédent : ce n'est ni un ajout, ni une fusion, ni un remplacement ligne par
+  ligne. Le remplacement est **atomique** (une seule écriture MongoDB).
+- Le serveur **réindexe** les combinaisons de 1 à 5 dans l'ordre reçu et **trie**
+  les numéros et les étoiles avant stockage.
+- Le payload est refusé si : il ne contient pas exactement 5 combinaisons, un
+  numéro est hors 1–50 ou dupliqué, une étoile est hors 1–12 ou dupliquée, ou la
+  date n'existe pas réellement.
+- Enregistrer une date **sans résultat officiel** est autorisé : les
+  combinaisons seront visibles dans l'historique, mais non comparables tant que
+  le résultat officiel n'est pas disponible.
+- L'écran affiche un retour visuel de succès ou d'échec ; en cas d'échec, les
+  combinaisons restent affichées et peuvent être réessayées.
+
+Conséquence métier : l'historique ne montre que la **dernière version
+enregistrée** pour chaque date. Il n'existe ni suppression ni conservation des
+versions antérieures dans l'interface ; une suppression nécessiterait une
+intervention directe en base (l'API n'expose pas de route `DELETE`).
+
+### 3. Historique des tirages (page `/history`)
+
+Page : http://localhost:5173/history
+
+#### Contenu de la liste
+
+L'historique est la **réunion de deux sources** :
+
+- les dates possédant un **résultat officiel** (collection `draw_data`) ;
+- les dates possédant des **combinaisons enregistrées**
+  (`generated_combinations`).
+
+Les dates sont triées de la plus récente à la plus ancienne. La page indique
+« **Tirage X sur Y** » : X = position courante (1 = tirage le plus récent), Y =
+nombre total de dates de la liste. Chaque date est chargée **à la demande** ;
+le détail déjà consulté est mis en cache en mémoire pour la durée de la visite.
+
+#### Affichage d'un tirage
+
+| Bloc | Contenu |
+| --- | --- |
+| **Résultat officiel** | Les **5 numéros** et **2 étoiles** réellement tirés, lus dans `draw_data`. Rien n'est inventé ni complété. |
+| **Combinaisons enregistrées** | Les **5 combinaisons** sauvegardées pour cette date, avec leurs numéros et étoiles. |
+| **Comparaison** | Pour chaque combinaison : nombre de **numéros** trouvés (sur 5) et d'**étoiles** trouvées (sur 2). |
+| **Surlignage vert** | Un numéro ou une étoile de la combinaison est affiché en vert lorsqu'il figure aussi dans le résultat officiel. |
+| **Jackpot** | Message « 🎉 C'est chouette, tu as gagné le jackpot ! » **uniquement** si la combinaison contient les 5 numéros **et** les 2 étoiles gagnants. |
+
+La comparaison se fait **par valeur, sans tenir compte de l'ordre** ; les
+numéros/étoiles étant stockés triés, l'ordre d'affichage est toujours croissant.
+Un jackpot n'est jamais affiché si le résultat officiel est absent, même si les
+valeurs semblaient correspondre.
+
+#### Navigation
+
+- **Tirage précédent** (flèche gauche) : affiche le tirage **plus ancien**.
+- **Tirage suivant** (flèche droite) : affiche le tirage **plus récent**.
+- Les deux boutons sont **désactivés aux bornes** : « précédent » sur la date la
+  plus ancienne, « suivant » sur la date la plus récente.
+- Chaque changement de tirage recharge uniquement le détail de la date
+  concernée (pas toute la liste).
+
+#### Cas particuliers
+
+| Situation | Comportement |
+| --- | --- |
+| Date avec résultat officiel mais **aucune combinaison** | Le résultat officiel s'affiche ; le bloc combinaisons indique « Aucune combinaison enregistrée pour ce tirage » et propose un lien vers le générateur. |
+| Date avec combinaisons mais **aucun résultat officiel** | Les combinaisons s'affichent avec la mention « En attente du résultat officiel » ; aucun nombre de correspondances, aucun surlignage vert, aucun jackpot. Un avertissement précise que les gains ne peuvent pas être validés. |
+| **Historique vide** | Message « Aucun tirage n'est disponible… » et lien vers le générateur. |
+| Erreur de chargement de la liste | Message d'erreur et bouton **Réessayer**. |
+| Erreur de chargement d'un tirage | Message d'erreur localisé dans les blocs du tirage concerné. |
+| Serveur indisponible | Message d'indisponibilité temporaire (pas de résultats partiels présentés comme fiables). |
+
+> Le résultat officiel provient exclusivement des données déjà importées dans
+> `draw_data`. Une date sans résultat officiel (par exemple un tirage non encore
+> importé ou non publié) reste donc explicitement non comparable ; l'application
+> ne devine ni ne déduit aucun résultat.
+
+### 4. Stockage et endpoints associés
+
+- Collection : `generated_combinations` (nom configurable via
+  `MONGO_COLLECTION_COMBINATIONS`), **un document par date** :
+
+  ```json
+  {
+    "_id": "23-10-2026",
+    "combinations": [
+      { "index": 1, "numbers": [1, 5, 12, 23, 44], "stars": [3, 9] },
+      { "index": 2, "numbers": [2, 7, 18, 33, 50], "stars": [1, 12] },
+      { "index": 3, "numbers": [4, 9, 16, 27, 38], "stars": [5, 8] },
+      { "index": 4, "numbers": [6, 11, 19, 31, 45], "stars": [2, 11] },
+      { "index": 5, "numbers": [3, 8, 22, 35, 49], "stars": [4, 7] }
+    ],
+    "updated_at": "2026-10-22T12:00:00"
+  }
+  ```
+
+- Aucune migration n'est nécessaire : la collection est créée au premier
+  enregistrement.
+- Routes (voir aussi [API overview](#api-overview)) :
+  - `GET /api/combinations/{date}` — combinaisons enregistrées (`[]` si aucune) ;
+  - `PUT /api/combinations/{date}` — enregistre/remplace les 5 combinaisons ;
+  - `GET /api/history` — liste légère des dates (union officiels + combinaisons) ;
+  - `GET /api/history/{date}` — détail d'un tirage (résultat officiel + comparaisons).
+
+### 5. Limites à connaître
+
+- **Non prédictif** : les combinaisons sont générées aléatoirement à partir des
+  numéros/étoiles disponibles ; elles n'exploitent pas les statistiques des
+  pages `/data-numbers` ou `/data-stars`.
+- **Pas de résultat officiel inventé** : sans donnée dans `draw_data`, aucune
+  correspondance n'est calculée et aucun jackpot n'est validé.
+- **Une seule version par date** : réenregistrer écrase l'ensemble précédent ;
+  aucun historique de versions n'est conservé.
+- **Pas de suppression dans l'UI** : il n'existe pas de bouton pour supprimer un
+  ensemble de combinaisons ; seul un remplacement est possible.
+- **Actualisation** : la liste d'historique est chargée à l'ouverture de la
+  page ; un enregistrement effectué dans un autre onglet n'apparaît qu'après
+  rechargement de la page.
+- **Dépendance aux imports** : la disponibilité et l'exactitude des résultats
+  officiels dépendent des données importées dans `draw_data`.
+
 ## API overview
 
 All routes are prefixed with `/api`:
@@ -517,6 +697,8 @@ All routes are prefixed with `/api`:
 - `GET /api/draw-data`, `DELETE /api/draw-data/{id}`, `POST /api/extract-drive`
 - `GET /api/numbers/{date}`, `GET /api/numbers/{date}/filter-options`
 - `GET /api/stars/{date}`
+- `GET /api/combinations/{date}`, `PUT /api/combinations/{date}`
+- `GET /api/history`, `GET /api/history/{date}`
 - `GET /api/charts/top`, `GET /api/charts/top-stars`
 - `GET /api/chart-*` — chart aggregates (out, report, delay, ecarts,
   frequency, progression, recent-frequency, frequency-previous-period, ...)
