@@ -527,7 +527,7 @@ barre latérale).
 Page : http://localhost:5173/
 
 1. Saisir une date de tirage au format `JJ-MM-AAAA` (la date du jour est
-   pré-remplie) puis cliquer **Démarrer**. La date doit être une date réelle :
+   pré-remplie) puis cliquer **Analyser**. La date doit être une date réelle :
    `32-13-2026` est refusé.
 2. L'application charge les **pools disponibles** pour cette date :
    - les 50 numéros via `GET /api/numbers/{date}` ;
@@ -690,6 +690,272 @@ valeurs semblaient correspondre.
 - **Dépendance aux imports** : la disponibilité et l'exactitude des résultats
   officiels dépendent des données importées dans `draw_data`.
 
+## Moteur statistique de combinaisons
+
+Page : http://localhost:5173/ (route `/`)
+
+Le moteur évalue **10 000 grilles candidates** avec les statistiques disponibles
+**avant** la date cible, puis retient les 5 meilleures combinaisons
+suffisamment différentes. Chaque grille est explicable (score, facteurs,
+profils, associations) et reproductible via une graine.
+
+> Aucun modèle ne peut prédire un tirage : les scores sont des estimations
+> historiques. Ils classent des grilles selon leur vraisemblance *passée*, pas
+> selon une probabilité de gain future.
+
+### 1. Données utilisées et absence de fuite
+
+- **Snapshot cible** : tableaux `numbers_full` / `stars_full` de la date
+  (50 numéros, 12 étoiles). Ces tableaux décrivent l'état **avant** le tirage :
+  une boule tirée le jour D a toujours un `last_out` antérieur à D.
+- Si la date exacte manque, le **dernier snapshot antérieur** est utilisé
+  (mentionné dans `sources`, `source_mode` et `warnings`). À défaut de
+  cache, les tableaux sont récupérés depuis Google Drive puis mis en cache.
+- **Historique officiel** : uniquement les tirages de `draw_data` dont la date
+  est **strictement antérieure** à la cible. Aucun résultat futur n'entre dans
+  les profils ni dans les associations.
+- Les indicateurs `sorties`, `progression` et `rapport_moyen` sont exclus du
+  score individuel : `sorties` duplique la fréquence, `progression` est
+  exactement `(récente - précédente) / précédente`, et `rapport_moyen` est un
+  gain, pas une fréquence de sortie.
+
+```bash
+docker exec euro_stat_be python scripts/audit_engine_data.py
+```
+
+Ce script en lecture seule vérifie les résultats officiels, la complétude des
+snapshots, l'alignement des tableaux `col_*`, la cohérence des indicateurs
+pré-tirage et l'absence de fuite. **Audit du 22-10-2026** : 21 résultats
+officiels valides (aucune boule dupliquée), 21 snapshots numéros et 19 snapshots
+étoiles complets, 693/693 valeurs `col_*` alignées, 0 anomalie de fuite,
+16/16 dates cibles avec snapshot exact (aucun fallback).
+
+### 2. Score individuel (probabilité par boule)
+
+**Problème corrigé en v1.1** : la fréquence long terme source n'est pas une
+probabilité par tirage. Sur tous les snapshots, la somme des 50 fréquences vaut
+environ **262** et celle des 12 étoiles environ **105**, alors que 5 numéros et
+2 étoiles sont tirés (sommes attendues : **500** et **200** en pourcentage).
+Le rapport `sorties / fréquence` est constant (~1978), ce qui indique un
+simple facteur d'échelle commun. Le moteur recalibre donc les fréquences :
+
+- `p_lt = (fréquence / 100) × 5 / Σ(fréquences numéros)` ;
+- `p_lt = (fréquence / 100) × 2 / Σ(fréquences étoiles)` pour les étoiles.
+
+La fréquence brute reste affichée dans l'API (`frequency`) ; la probabilité
+recalibrée est exposée séparément (`probability`). Pour chaque boule :
+
+- `p_recent = (récente + 25 × p_lt) / 50` (25 derniers tirages) ;
+- `p_prev = (précédente + 25 × p_lt) / 50` (25 tirages précédents).
+
+`p_est = moyenne(p_lt, p_recent, p_prev)`, bornée à `[10^-6, 1]` ; une valeur
+absente est remplacée par `1/50` (numéros) ou `1/12` (étoiles) et signalée
+dans `warnings`. Le facteur `individual` d'une grille est la moyenne des
+`log(p_est)` de ses 5 numéros et 2 étoiles.
+
+### 3. Profil de la grille (8 familles)
+
+Chaque famille est modélisée sur les tirages antérieurs avec un lissage de
+Laplace `(occurrences + 1) / (n + U)` (`U = valeurs distinctes observées + 1`) :
+
+| Famille | Signature |
+| --- | --- |
+| `numbers_pair` | nombre de numéros pairs parmi les 5 |
+| `numbers_low` | nombre de numéros dans 1-25 |
+| `numbers_tens` | répartition par dizaines, ex. `[10-19]x2 \| [30-39]x3` |
+| `numbers_frequency` | tranches entières de fréquence, ex. `4x1 \| 5x4` |
+| `numbers_delay` | plages de retard `[0-5] / [6-10] / [11+]` |
+| `stars_pair` | nombre d'étoiles paires |
+| `stars_frequency` | tranches entières de fréquence des étoiles |
+| `stars_delay` | plages de retard des étoiles |
+
+Le facteur `profile` est la moyenne des log-probabilités de ces familles.
+Il exige au moins **5 tirages** antérieurs. Ces familles sont fixes, sans
+coefficient ajusté sur les résultats du backtest.
+
+### 4. Associations (paires)
+
+Pour chaque paire (10 paires de numéros, 1 paire d'étoiles, et 10 paires
+numéro-étoile si l'historique atteint 30 tirages) :
+
+- probabilité attendue corrigée du tirage sans remise :
+  `q = p_i × p_j × N × (k-1) / (k × (N-1))` pour deux boules du même
+  réservoir (`N=50, k=5` ou `N=12, k=2`) ;
+- `q = p_i × p_j` pour une paire numéro-étoile (réservoirs séparés) ;
+- `lift = (c + 1) / (n × q + 1)`, `w = c / (c + 2)`, contribution
+  `log(1 + w × (lift - 1))` ;
+- fiabilité globale `n / (n + 30)` appliquée à la moyenne des paires.
+
+Les associations sont désactivées sous **10 tirages**. Le facteur
+`associations` est cette moyenne pondérée ; les paires non observées ont une
+contribution nulle. Les paires numéro-étoile ne sont pas évaluables sur
+l'historique actuel (moins de 30 tirages avant chaque cible).
+
+### 5. Agrégation, classement et diversité
+
+1. Les trois dimensions (`individual`, `profile`, `associations`) sont
+   **z-normalisées sur les candidates** (moyenne 0, écart-type 1).
+2. `score = (z_individual + z_profile + z_associations) / 3` : poids égaux.
+   Les flags `use_individual` / `use_profiles` / `use_associations` servent
+   uniquement aux ablations du backtest ; au moins une dimension est requise.
+3. `relative_score` = percentile du score parmi les candidates (0 = pire,
+   100 = meilleure) ; `rank` = position (1 = meilleure).
+4. **Échantillonnage** : `uniform` par défaut ; `guided` (pondéré par
+   `p_est`) reste disponible pour comparaison. Dans les deux cas, les
+   candidates sont **distinctes**.
+5. **Diversité** : similarité `0,7 × numéros communs / 5 + 0,3 × étoiles
+   communes / 2`. Les grilles sont prises par score décroissant en rejetant
+   toute similarité `> 0,5` ; le seuil augmente par pas de `0,05` si besoin.
+6. La graine (`seed`) rend l'ensemble reproductible ; elle est affichée avec
+   le nombre de candidates et la durée d'exécution.
+
+Le passage de `guided` à `uniform` par défaut est justifié par l'absence de
+gain mesuré de l'échantillonnage guidé et par le fait qu'un classement doit
+porter sur un échantillon représentatif, sans double emploi des probabilités
+individuelles.
+
+### 6. API
+
+```http
+GET /api/combination-engine/{JJ-MM-AAAA}?seed=42&candidates=10000&sampling=uniform
+```
+
+| Paramètre | Défaut | Valeurs |
+| --- | --- | --- |
+| `seed` | aléatoire (renvoyé) | entier 0 à 2^32-1 |
+| `candidates` | `10000` | 100 à 50 000 |
+| `sampling` | `uniform` | `uniform` ou `guided` |
+
+La réponse contient : `date`, `seed`, `candidates`, `sampling`,
+`elapsed_ms`, `source_mode` (`cache`/`drive`/`fallback`), `history`,
+`sources`, `warnings`, les 50 + 12 indicateurs normalisés (fréquence source
+et probabilité recalibrée), les 5 `combinations` (score, rang, percentile,
+dimensions, facteurs, probabilités par boule, profils, associations,
+similarité), `selected_diversity` et `meta` (formules, calibration,
+pondérations, dimensions actives, limites). Codes d'erreur : `400`
+date/paramètres invalides, `409` snapshot incomplet ou historique
+`< 5` tirages, `502` Google Drive indisponible. L'API ne fait aucune écriture
+MongoDB.
+
+### 7. Vue détaillée (frontend)
+
+Le bouton **Analyse détaillée** ouvre une modale (`EngineDetailsModal.tsx`)
+qui affiche, pour chaque grille : décomposition du score et valeurs z,
+probabilité estimée de chaque boule (fréquence source, retard), profil famille
+par famille (clé observée, effectif, log-probabilité), associations triées par
+contribution, fiabilité, similarité maximale et métadonnées du modèle.
+
+- **Nouvelle combinaison** change la graine et relance l'analyse sur la même
+  date. L'enregistrement reste **explicite** (même règle : un seul ensemble de
+  5 grilles par date, remplacement atomique).
+- Repli technique uniquement : si le moteur est injoignable (`status 0` ou
+  `>= 500`), l'ancien tirage aléatoire est utilisé et clairement signalé. Une
+  erreur de données (`400`, `404`, `409`) n'active **jamais** ce repli.
+
+### 8. Backtest chronologique
+
+Le script `euro-stat-BE/scripts/backtest_engine.py` rejoue chaque tirage
+éligible (au moins 5 tirages antérieurs et un snapshot sans fuite), génère 5
+grilles avec les seules données passées, puis compare *après coup* au résultat
+officiel.
+
+**Protocole** : 16 dates cibles (28-08-2026 → 20-10-2026), 5 graines
+(1 à 5), 5 grilles par modèle et par date/graine, soit **400 grilles par
+variante** avec 10 000 candidates. Tous les modèles voient les mêmes dates et
+graines. La référence aléatoire produit 5 grilles distinctes (5/50 + 2/12). Les
+intervalles de confiance à 95 % sont obtenus par **bootstrap sur les dates**
+(2 000 rééchantillonnages, graines regroupées, graine 20261022). Le découpage
+60/40 et les tiers chronologiques sont descriptifs : aucun hyperparamètre n'a
+été choisi sur ces résultats.
+
+```bash
+docker exec euro_stat_be python scripts/backtest_engine.py \
+  --candidates 10000 --seeds 1,2,3,4,5 --output /app/backtest.json
+```
+
+| Variante | Principe |
+| --- | --- |
+| `aleatoire` | 5 grilles uniformes distinctes, sans statistique |
+| `moteur_uniforme` | moteur complet, candidates uniformes (défaut API) |
+| `moteur_guide` | moteur complet, candidates guidées par `p_est` |
+| `individuel_seul` | score individuel uniquement |
+| `profil_seul` | profils uniquement |
+| `associations_seul` | associations uniquement |
+| `sans_associations` | individuel + profils |
+
+Métriques produites : moyennes numéros/étoiles, meilleur résultat par tirage,
+distributions 0-5 numéros et 0-2 étoiles, distribution conjointe, taux ≥ 2/3/4
+numéros, deux étoiles avec/sans numéros, jackpots, diversité, temps de calcul,
+résultats globaux, par graine, par période et comparaison appariée à la
+référence aléatoire.
+
+**Résultats globaux (10 000 candidates, graines 1-5, 400 grilles/variante)** :
+
+| Variante | Numéros (IC 95 %) | Étoiles (IC 95 %) | Meilleur / tirage | ≥ 2 num. | ≥ 3 num. | 2 étoiles | Temps/run |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `aleatoire` | 0,480 [0,415 ; 0,547] | 0,330 [0,292 ; 0,367] | 1,238 | 6,75 % | 0,50 % | 1,25 % | 0 ms |
+| `moteur_uniforme` | 0,522 [0,425 ; 0,615] | 0,405 [0,273 ; 0,535] | 1,275 | 8,00 % | 0,25 % | 1,50 % | 764 ms |
+| `moteur_guide` | 0,505 [0,380 ; 0,642] | 0,328 [0,215 ; 0,432] | 1,150 | 7,50 % | 0 % | 1,25 % | 833 ms |
+| `individuel_seul` | 0,438 [0,268 ; 0,645] | 0,278 [0,170 ; 0,405] | 0,963 | 6,25 % | 0,25 % | 0,25 % | 226 ms |
+| `profil_seul` | 0,527 [0,453 ; 0,598] | 0,315 [0,208 ; 0,432] | 1,350 | 8,00 % | 1,00 % | 0,75 % | 345 ms |
+| `associations_seul` | 0,560 [0,390 ; 0,743] | 0,385 [0,300 ; 0,465] | 1,262 | 8,00 % | 0,75 % | 1,00 % | 269 ms |
+| `sans_associations` | 0,460 [0,343 ; 0,585] | 0,285 [0,190 ; 0,378] | 1,113 | 6,75 % | 0,50 % | 0,25 % | 533 ms |
+
+Différences appariées vs aléatoire (numéros, IC 95 %) :
+`moteur_uniforme` +0,042 [-0,085 ; +0,173] ; `profil_seul` +0,048
+[-0,068 ; +0,148] ; `associations_seul` +0,080 [-0,115 ; +0,280] ;
+`moteur_guide` +0,025 [-0,128 ; +0,195] ; `individuel_seul` -0,043
+[-0,223 ; +0,187] ; `sans_associations` -0,020 [-0,143 ; +0,120]. Toutes
+les différences incluent zéro.
+
+Distributions des correspondances en numéros (aucune grille à 4 ou 5
+numéros dans cet échantillon) :
+
+| Numéros corrects | `aleatoire` | `moteur_uniforme` |
+| --- | --- | --- |
+| 0 | 59,25 % | 56,00 % |
+| 1 | 34,00 % | 36,00 % |
+| 2 | 6,25 % | 7,75 % |
+| 3 | 0,50 % | 0,25 % |
+| 4-5 | 0 % | 0 % |
+
+Étoiles correctes : 0/1/2 = 68,25 % / 30,50 % / 1,25 % pour l'aléatoire et
+61,00 % / 37,50 % / 1,50 % pour le moteur uniforme. Jackpots : 0 partout.
+
+**Sensibilité** : avec 1 000 candidates et 10 graines, l'aléatoire obtenait
+0,484 numéro et le moteur uniforme 0,470 ; avec 10 000 candidates et 5 graines,
+les valeurs sont 0,480 et 0,522. Le signe de l'écart change : c'est le signe
+d'un bruit d'échantillonnage, pas d'un effet robuste. Les résultats par période
+varient également fortement (par ex. moteur uniforme : 0,512 / 0,488 / 0,560
+numéros sur les trois tiers ; aléatoire : 0,456 / 0,584 / 0,413).
+
+**Conclusion honnête** : aucune variante ne surpasse la référence aléatoire de
+manière convaincante. Les associations seules ont la meilleure moyenne
+ponctuelle (+0,080 numéro), mais leur IC inclut zéro [-0,115 ; +0,280] et
+l'échantillon ne permet pas de conclure à un avantage. Sur le découpage 60/40,
+les écarts restent instables (associations 0,542 puis 0,583 ; aléatoire 0,520
+puis 0,429 numéros), avec de très petits effectifs. Le score individuel seul est
+en retrait. Les profils et associations ne démontrent pas de valeur prédictive
+hors échantillon. Le moteur reste utile comme outil d'explication et de
+génération reproductible, pas comme prédicteur.
+
+### 9. Limites
+
+- Les tirages EuroMillions sont indépendants : le score ne change pas la
+  probabilité réelle de gagner.
+- L'historique disponible est court (21 tirages officiels, 16 cibles
+  évaluables) ; les IC restent larges et les paires numéro-étoile ne peuvent
+  pas être évaluées.
+- La fréquence long terme est recalibrée à partir d'hypothèses de cohérence
+  d'échelle ; la calibration ne crée pas d'information prédictive.
+- Les snapshots sont des instantanés des tableaux source : une date sans
+  snapshot exact réutilise un état antérieur (aucun cas sur les 16 cibles
+  actuelles).
+- Le backtest mesure des correspondances, pas un rendement financier ; les
+  jackpots sont trop rares pour être estimés sur cet échantillon.
+- Aucun résultat officiel n'est inventé ; une date sans résultat reste non
+  comparable dans `/history`.
+
 ## API overview
 
 All routes are prefixed with `/api`:
@@ -699,6 +965,7 @@ All routes are prefixed with `/api`:
 - `GET /api/stars/{date}`
 - `GET /api/combinations/{date}`, `PUT /api/combinations/{date}`
 - `GET /api/history`, `GET /api/history/{date}`
+- `GET /api/combination-engine/{date}` — moteur statistique (seed, candidates, sampling ; défaut `uniform`)
 - `GET /api/charts/top`, `GET /api/charts/top-stars`
 - `GET /api/chart-*` — chart aggregates (out, report, delay, ecarts,
   frequency, progression, recent-frequency, frequency-previous-period, ...)
