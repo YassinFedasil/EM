@@ -44,3 +44,5 @@ yarn-error.log*
 
 # Docker data (if any was local)
 **/mongo_data/
+**/.claude/
+**/.agents/
